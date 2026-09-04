@@ -2,7 +2,12 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
-import { computeAttention, SENSITIVITY_THRESHOLDS, type Priority, type Sensitivity } from "@/lib/attention/engine";
+import {
+  computeAttention,
+  SENSITIVITY_THRESHOLDS,
+  type Priority,
+  type Sensitivity,
+} from "@/lib/attention/engine";
 import { getMarketDataProvider, scenarioFor } from "@/lib/market/demo-provider";
 import { INSTRUMENTS, findInstrument, isSupportedSymbol } from "@/lib/market/instruments";
 import { freshnessFor, type MarketEventRecord, type MarketObservation } from "@/lib/market/types";
@@ -80,6 +85,49 @@ function splitByRecency(rows: SnapshotRow[]) {
   return { latest, previous };
 }
 
+async function loadDashboardObservations(
+  supabase: any,
+  symbols: string[],
+  lastSeenAt: string | null,
+) {
+  if (!lastSeenAt) {
+    const { data, error } = await supabase
+      .from("market_snapshots")
+      .select(SNAPSHOT_COLUMNS)
+      .in("symbol", symbols)
+      .order("observed_at", { ascending: false })
+      .limit(symbols.length * 8);
+    if (error) fail(`Could not load market data: ${error.message}`);
+    return splitByRecency((data ?? []) as SnapshotRow[]);
+  }
+
+  const [newResult, baselineResult] = await Promise.all([
+    supabase
+      .from("market_snapshots")
+      .select(SNAPSHOT_COLUMNS)
+      .in("symbol", symbols)
+      .gt("observed_at", lastSeenAt)
+      .order("observed_at", { ascending: false }),
+    supabase
+      .from("market_snapshots")
+      .select(SNAPSHOT_COLUMNS)
+      .in("symbol", symbols)
+      .lte("observed_at", lastSeenAt)
+      .order("observed_at", { ascending: false }),
+  ]);
+  if (newResult.error) fail(`Could not load new market data: ${newResult.error.message}`);
+  if (baselineResult.error) fail(`Could not load market baseline: ${baselineResult.error.message}`);
+
+  const newObservations = splitByRecency((newResult.data ?? []) as SnapshotRow[]);
+  const baseline = splitByRecency((baselineResult.data ?? []) as SnapshotRow[]);
+  const latest = new Map(newObservations.latest);
+  for (const [symbol, observation] of baseline.latest) {
+    if (!latest.has(symbol)) latest.set(symbol, observation);
+  }
+
+  return { latest, previous: baseline.latest };
+}
+
 type Supa = Parameters<Parameters<typeof requireSupabaseAuth.server>[0]>[0] extends never
   ? never
   : never;
@@ -119,7 +167,9 @@ async function resolveWatchlist(supabase: any, userId: string, requested?: strin
 export const getDashboard = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
-    z.object({ watchlistId: z.string().uuid().optional() }).parse(input ?? {}),
+    z
+      .object({ watchlistId: z.string().uuid().optional(), refreshToken: z.number().optional() })
+      .parse(input ?? {}),
   )
   .handler(async ({ data, context }) => {
     const { supabase, userId } = context;
@@ -130,7 +180,7 @@ export const getDashboard = createServerFn({ method: "GET" })
       data.watchlistId ??
       (watchlists.some((w: any) => w.id === profile.default_watchlist_id)
         ? profile.default_watchlist_id
-        : watchlists[0]?.id ?? null);
+        : (watchlists[0]?.id ?? null));
 
     const serverNow = new Date().toISOString();
     const base = {
@@ -139,7 +189,10 @@ export const getDashboard = createServerFn({ method: "GET" })
       activeWatchlistId: activeId,
       lastVisitAt: profile.last_seen_at as string | null,
       serverNow,
-      provider: { label: getMarketDataProvider().label, isSimulated: getMarketDataProvider().isSimulated },
+      provider: {
+        label: getMarketDataProvider().label,
+        isSimulated: getMarketDataProvider().isSimulated,
+      },
       threshold: SENSITIVITY_THRESHOLDS[profile.attention_sensitivity as Sensitivity],
     };
 
@@ -160,21 +213,17 @@ export const getDashboard = createServerFn({ method: "GET" })
     if (watched.length === 0) return { ...base, dashboard: null, itemCount: 0 };
 
     const symbols = watched.map((w) => w.symbol);
-    const { data: snapshots, error: snapError } = await supabase
-      .from("market_snapshots")
-      .select(SNAPSHOT_COLUMNS)
-      .in("symbol", symbols)
-      .order("observed_at", { ascending: false })
-      .limit(symbols.length * 8);
-    if (snapError) fail(`Could not load market data: ${snapError.message}`);
-
-    const { latest, previous } = splitByRecency((snapshots ?? []) as SnapshotRow[]);
+    const { latest, previous } = await loadDashboardObservations(
+      supabase,
+      symbols,
+      profile.last_seen_at as string | null,
+    );
 
     const { data: eventRows, error: eventError } = await supabase
       .from("market_events")
       .select("symbol, event_type, title, description, importance, event_time")
       .in("symbol", symbols)
-      .gte("event_time", new Date(Date.now() - 24 * 3600_000).toISOString())
+      .gte("event_time", profile.last_seen_at ?? new Date(Date.now() - 24 * 3600_000).toISOString())
       .order("event_time", { ascending: false });
     if (eventError) fail(`Could not load market events: ${eventError.message}`);
 
@@ -189,6 +238,7 @@ export const getDashboard = createServerFn({ method: "GET" })
       previousObservations: previous,
       events,
       sensitivity: profile.attention_sensitivity as Sensitivity,
+      since: profile.last_seen_at as string | null,
     });
 
     // Persist detected changes so the same ongoing movement is not re-reported
@@ -258,7 +308,7 @@ export const markDashboardSeen = createServerFn({ method: "POST" })
 export const simulateMarketUpdate = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
-    const { supabase } = context;
+    const { supabase, userId } = context;
     const symbols = INSTRUMENTS.map((i) => i.symbol);
 
     const { data: snapshots, error } = await supabase
@@ -281,6 +331,15 @@ export const simulateMarketUpdate = createServerFn({ method: "POST" })
     const provider = getMarketDataProvider();
     const next = provider.nextObservations([...latest.values()], step);
 
+    const { data: profile, error: profileError } = await supabase
+      .from("profiles")
+      .select("last_seen_at")
+      .eq("id", userId)
+      .maybeSingle();
+    if (profileError)
+      fail(`Simulation failed while reading your visit state: ${profileError.message}`);
+    const lastSeenAt = profile?.last_seen_at ? Date.parse(profile.last_seen_at) : null;
+
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const rows = next.map((o) => ({
       symbol: o.symbol,
@@ -292,7 +351,10 @@ export const simulateMarketUpdate = createServerFn({ method: "POST" })
       volatility: o.volatility,
       benchmark_change: o.benchmarkChange,
       sector_change: o.sectorChange,
-      observed_at: o.observedAt,
+      observed_at:
+        lastSeenAt !== null && o.freshness !== "stale" && Date.parse(o.observedAt) <= lastSeenAt
+          ? new Date(lastSeenAt + 1).toISOString()
+          : o.observedAt,
       source: o.source,
       freshness: o.freshness,
     }));
@@ -411,10 +473,15 @@ export const getWatchlistView = createServerFn({ method: "GET" })
       data.watchlistId ??
       (watchlists.some((w: any) => w.id === profile.default_watchlist_id)
         ? profile.default_watchlist_id
-        : watchlists[0]?.id ?? null);
+        : (watchlists[0]?.id ?? null));
 
     if (!activeId) {
-      return { watchlists, activeWatchlistId: null, items: [], defaultWatchlistId: profile.default_watchlist_id };
+      return {
+        watchlists,
+        activeWatchlistId: null,
+        items: [],
+        defaultWatchlistId: profile.default_watchlist_id,
+      };
     }
 
     const { data: items, error } = await supabase
@@ -458,7 +525,9 @@ export const getWatchlistView = createServerFn({ method: "GET" })
 
 export const createWatchlist = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((input: unknown) => z.object({ name: z.string().trim().min(1).max(60) }).parse(input))
+  .inputValidator((input: unknown) =>
+    z.object({ name: z.string().trim().min(1).max(60) }).parse(input),
+  )
   .handler(async ({ data, context }) => {
     const { supabase, userId } = context;
     const { data: created, error } = await supabase
@@ -467,7 +536,12 @@ export const createWatchlist = createServerFn({ method: "POST" })
       .select("id, name")
       .single();
     if (error) {
-      if (error.code === "23505" || error.code === "23P01" || error.code === "23000" || error.code === "23514")
+      if (
+        error.code === "23505" ||
+        error.code === "23P01" ||
+        error.code === "23000" ||
+        error.code === "23514"
+      )
         fail(`Could not create the watchlist: ${error.message}`);
       if (error.code === "23499" || error.code === "23503") fail("Could not create the watchlist.");
       fail(
@@ -482,7 +556,9 @@ export const createWatchlist = createServerFn({ method: "POST" })
 export const renameWatchlist = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
-    z.object({ watchlistId: z.string().uuid(), name: z.string().trim().min(1).max(60) }).parse(input),
+    z
+      .object({ watchlistId: z.string().uuid(), name: z.string().trim().min(1).max(60) })
+      .parse(input),
   )
   .handler(async ({ data, context }) => {
     const { supabase, userId } = context;
@@ -582,6 +658,16 @@ export const updateSettings = createServerFn({ method: "POST" })
   )
   .handler(async ({ data, context }) => {
     const { supabase, userId } = context;
+    if (data.defaultWatchlistId) {
+      const { data: ownedWatchlist, error: watchlistError } = await supabase
+        .from("watchlists")
+        .select("id")
+        .eq("id", data.defaultWatchlistId)
+        .eq("user_id", userId)
+        .maybeSingle();
+      if (watchlistError) fail(`Could not verify your default watchlist: ${watchlistError.message}`);
+      if (!ownedWatchlist) fail("That watchlist does not belong to your account.");
+    }
     const patch: Record<string, unknown> = {};
     if (data.attentionSensitivity) patch.attention_sensitivity = data.attentionSensitivity;
     if (data.defaultWatchlistId !== undefined) patch.default_watchlist_id = data.defaultWatchlistId;

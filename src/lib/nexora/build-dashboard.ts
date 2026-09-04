@@ -38,13 +38,15 @@ export interface DashboardModel {
 
 export interface BuildDashboardInput {
   watched: WatchedSymbol[];
-  /** Latest observation per symbol, keyed by symbol. */
+  /** Latest observation to display per symbol, keyed by symbol. */
   observations: Map<string, MarketObservation & { snapshotId: string }>;
-  /** Previous observation per symbol (for volatility change). */
+  /** Baseline observation per symbol, normally the latest row at/before `since`. */
   previousObservations: Map<string, MarketObservation>;
   /** Most recent relevant event per symbol. */
   events: Map<string, MarketEventRecord>;
   sensitivity: Sensitivity;
+  /** Only observations after this timestamp can be surfaced as new changes. */
+  since?: string | null;
   /** Snapshot ids already recorded as seen for this user. */
   seenSnapshotIds?: Set<string>;
   now?: Date;
@@ -70,6 +72,7 @@ export function buildDashboard(input: BuildDashboardInput): DashboardModel {
     if (!latest || observation.observedAt > latest) latest = observation.observedAt;
 
     const event = input.events.get(watched.symbol) ?? null;
+    const isNewObservation = !input.since || observation.observedAt > input.since;
     const attention = computeAttention({
       observation: { ...observation, freshness },
       previousObservation: input.previousObservations.get(watched.symbol) ?? null,
@@ -77,7 +80,7 @@ export function buildDashboard(input: BuildDashboardInput): DashboardModel {
       priority: watched.priority,
     });
 
-    if (isSurfaced(attention.attentionScore, input.sensitivity)) {
+    if (isNewObservation && isSurfaced(attention.attentionScore, input.sensitivity)) {
       meaningful.push({
         symbol: observation.symbol,
         companyName: observation.companyName,
@@ -102,7 +105,8 @@ export function buildDashboard(input: BuildDashboardInput): DashboardModel {
   }
 
   meaningful.sort(
-    (a, b) => b.attention.attentionScore - a.attention.attentionScore || a.symbol.localeCompare(b.symbol),
+    (a, b) =>
+      b.attention.attentionScore - a.attention.attentionScore || a.symbol.localeCompare(b.symbol),
   );
 
   return {
